@@ -122,10 +122,7 @@ dependencies:
       path: packages/on_audio_query
 
   # ---- Video Indexing & Playback ----
-  ffmpeg_kit_flutter:
-    git:
-      url: https://github.com/MSOB7YY/ffmpeg-kit
-      path: flutter/flutter
+  ffmpeg_kit_flutter: ^6.0.3
   youtipie:
     git:
       url: https://github.com/namidaco/youtipie
