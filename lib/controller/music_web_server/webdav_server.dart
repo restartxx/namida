@@ -23,28 +23,30 @@ class _WebDAVServer extends MusicWebServer {
     _api?.close(force: true);
   }
 
+  // MODIFICADO: Agora ele não baixa o arquivo inteiro para tocar!
+  // Ele gera uma URL direta com autenticação para streaming em tempo real (VFS nativo).
   @override
   Future<WebStreamUriDetails?> getStreamUrl(String id, {void Function(File cachedFile)? onFetchedIfLocal}) async {
-    final api = _api;
-    if (api == null) return null;
+    final baseUri = _serverUri;
+    if (baseUri == null) return null;
 
     final serverPath = Uri.decodeQueryComponent(id);
-    final tempFile = FileParts.joinAll([
-      AppDirs.APP_CACHE,
-      authDetails.dir.type.name,
-      authDetails.auth.username,
-      ...serverPath.split('/'),
-    ]);
-
-    await api.read2File(serverPath, tempFile.path);
-
-    onFetchedIfLocal?.call(tempFile);
-
-    final newUri = Uri.file(tempFile.path);
+    final authInfo = authDetails.auth.toWebDAVAuthModel();
+    
+    // Injeta usuário e senha na URL para o player nativo (ExoPlayer/mpv) stremar direto
+    final userInfo = '${Uri.encodeComponent(authInfo.username)}:${Uri.encodeComponent(authInfo.password)}';
+    
+    var cleanBasePath = baseUri.path.replaceAll(RegExp(r'/$'), '');
+    var cleanServerPath = serverPath.replaceAll(RegExp(r'^/'), '');
+    
+    final directStreamUri = baseUri.replace(
+      userInfo: userInfo,
+      path: '$cleanBasePath/$cleanServerPath',
+    );
 
     return WebStreamUriDetails.fromUri(
-      newUri,
-      allowStreamCaching: false, // already cached
+      directStreamUri,
+      allowStreamCaching: true, // Permite que o player faça cache on-the-fly
     );
   }
 
@@ -135,14 +137,24 @@ class _WebDAVServer extends MusicWebServer {
       final batch = files.skip(i).take(subBatchSize);
       final subfiles = <webdav.File>[];
       final subdirectories = <webdav.File>[];
+      
+      // PREPARADO: Balde para salvar a imagem da pasta caso exista
+      String? folderCoverPath;
 
       for (final file in batch) {
         if (file.isDir == true) {
           subdirectories.add(file);
         } else {
           final path = file.path;
-          if (path != null && NamidaFileExtensionsWrapper.audioAndVideo.isPathValid(path)) {
-            subfiles.add(file);
+          if (path != null) {
+            if (NamidaFileExtensionsWrapper.audioAndVideo.isPathValid(path)) {
+              subfiles.add(file);
+            } else if (path.toLowerCase().endsWith('.jpg') || 
+                       path.toLowerCase().endsWith('.png') || 
+                       path.toLowerCase().endsWith('.jpeg')) {
+              // Se achou uma imagem (cover.jpg/folder.jpg), guarda o caminho
+              folderCoverPath ??= path; 
+            }
           }
         }
       }
@@ -265,7 +277,8 @@ class _WebDAVServer extends MusicWebServer {
     final tempFile = FileParts.join(AppDirs.APP_CACHE, authDetails.dir.type.name, authDetails.auth.username, serverPath.toFastHashKey());
     final networkId = serverPath;
     try {
-      await api.read2File(serverPath, tempFile.path);
+      // MODIFICADO: Chama nossa função que baixa apenas 3MB ao invés do arquivo inteiro!
+      await api.readPartialFile(serverPath, tempFile.path, bytes: 3145728); 
       final isVideo = name.isVideo() == true;
       final res = await builder(tempFile, isVideo, networkId);
       return (res, networkId, tempFile);
@@ -316,7 +329,6 @@ class _ClientApiWrapper {
   }
 
   Future<void> ping() async {
-    // -- even ping can fail if not pre authorized
     return await _executeEnsureAuthorized(
       (api) => api.ping(),
     );
@@ -336,6 +348,37 @@ class _ClientApiWrapper {
         cancelToken: cancelToken,
       ),
     );
+  }
+
+  // NOVA FUNÇÃO INJETADA: Faz a requisição HTTP Range usando a engine do Dio
+  Future<void> readPartialFile(
+    String path,
+    String savePath, {
+    int bytes = 3145728, // Puxa só os primeiros 3MB
+    CancelToken? cancelToken,
+  }) async {
+    return await _executeEnsureAuthorized((api) async {
+      final response = await api.c.get<ResponseBody>(
+        path,
+        cancelToken: cancelToken,
+        options: Options(
+          responseType: ResponseType.stream,
+          headers: {
+            'Range': 'bytes=0-$bytes',
+          },
+        ),
+      );
+
+      final file = File(savePath);
+      final raf = file.openSync(mode: FileMode.write);
+      try {
+        await for (final chunk in response.data!.stream) {
+          raf.writeFromSync(chunk);
+        }
+      } finally {
+        raf.closeSync();
+      }
+    });
   }
 
   Future<List<webdav.File>> readDir(String path, [CancelToken? cancelToken]) async {
